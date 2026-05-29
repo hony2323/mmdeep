@@ -95,3 +95,45 @@ jobs:
             src-tauri/target/release/bundle/**/*.AppImage
             src-tauri/target/release/bundle/**/*.deb
           if-no-files-found: ignore
+
+  tag:
+    name: auto-tag (feat commits)
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: detect feat commit & create tag
+        env:
+          TAG_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          MSG=$(git log -1 --format='%s')
+          if [[ ! $MSG =~ ^feat: ]]; then
+            echo "Not a feat commit, skipping."
+            exit 0
+          fi
+
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          if [[ -z "$LATEST" ]]; then
+            NEW_TAG="v0.1.0"
+          else
+            IFS='.' read -r -a VER <<< "${LATEST#v}"
+            MAJOR="${VER[0]}"
+            MINOR="${VER[1]}"
+            NEW_TAG="v${MAJOR}.$((MINOR+1)).0"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+
+          git remote set-url origin "https://x-access-token:${TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "$NEW_TAG"
+
+          echo "Created and pushed tag: $NEW_TAG"
