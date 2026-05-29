@@ -219,7 +219,8 @@ button.full {
   border-radius: 999px;
   color: #07101f;
 }
-.hud .pill.discovery {
+.hud .pill.discovery,
+.hud .pill.map {
   background: var(--accent);
 }
 .hud .pill.overview {

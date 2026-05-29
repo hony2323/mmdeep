@@ -13,14 +13,17 @@ edges. mmdeep takes a different approach:
 - **Native parse + index** (Rust): a streaming Mermaid-flowchart parser builds a
   compact CSR (compressed-sparse-row) graph. 1.4M edges parses in ~2.5s and
   holds in ~70 MB RAM.
-- **Never render the whole graph.** The UI only ever draws what you can see:
-  - **Discovery mode** — start from seed/root nodes and **page in neighbours on
-    demand** ("pagination for graphs"). Each click loads the next chunk of a
-    node's neighbours; truncated frontiers show a `+N more` badge.
-  - **Overview mode** — a whole-graph Barnes-Hut force layout (computed once and
-    cached to disk) rendered with **WebGL + viewport culling + level-of-detail**
-    via Sigma.js, so panning/zooming only queries the nodes in view (answered by
-    an R-tree in a few milliseconds).
+- **Never render the whole graph.** The entire graph is laid out once into a
+  fixed "world" (a whole-graph Barnes-Hut force layout, computed once and cached
+  to disk), then explored **like a map — pan and zoom**:
+  - The renderer pins Sigma.js's coordinate box to the full-graph bounds, so the
+    world is stable while you drag/zoom.
+  - Only the nodes/edges inside the current viewport are sent to the frontend,
+    **ranked by importance (degree)** up to a budget: zoomed out shows the major
+    hubs (like cities on a map), zooming in reveals local detail (like streets).
+    A grid level-of-detail index answers each viewport query in a few ms.
+  - Hover a node to highlight it and its neighbours; search or click to fly to a
+    node anywhere in the world.
 
 ## Architecture
 
@@ -34,7 +37,8 @@ edges. mmdeep takes a different approach:
 - `crates/mmdeep-core` — UI-agnostic engine. Also ships a headless CLI
   (`mmdeep-core`) used for testing and benchmarking.
 - `src-tauri` — Tauri v2 app; thin command layer over the core.
-- `src` — Vite + React + TypeScript frontend; Sigma.js/graphology renderer.
+- `src` — Vite + React + TypeScript frontend; Sigma.js/graphology map renderer
+  (fixed-world `setCustomBBox`, viewport diff-loading, importance LOD).
 - `scripts` — Python generators and the benchmark harness.
 
 ## Prerequisites
@@ -86,12 +90,11 @@ layout time, and viewport-query latency.
 
 | metric                 | value      |
 | ---------------------- | ---------- |
-| parse + index          | ~2.5 s     |
-| memory                 | ~70 MB     |
-| roots / first render   | ~5 ms      |
-| neighbour expand       | <1 ms      |
-| viewport query         | ~8 ms      |
-| overview layout (once) | ~45 s, then cached (~2.7 s reopen) |
+| parse + index            | ~2.5 s     |
+| memory                   | ~70 MB     |
+| viewport query (pan/zoom)| ~5–8 ms    |
+| search                   | a few ms   |
+| map layout (once)        | ~45 s, then cached (~2.7 s reopen) |
 
 ## License
 

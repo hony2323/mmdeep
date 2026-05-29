@@ -307,6 +307,44 @@ pub fn global_force(g: &Graph, iterations: usize) -> Vec<[f32; 2]> {
         }
         temp = (temp - cooling).max(spread * 0.001);
     }
+
+    // Rescale to a large, centred world so the map has plenty of zoom range:
+    // node glyphs keep a roughly constant screen size, so a bigger world means
+    // zooming in separates nodes that the force pass packed tightly together.
+    //
+    // Center on the centroid (not the bbox centre) and size the world by a
+    // percentile radius, then clamp rare outliers to the edge. This keeps the
+    // dense mass centred and filling the viewport instead of being pushed off to
+    // one side by a handful of far-flung nodes.
+    let (mut cx, mut cy) = (0.0f64, 0.0f64);
+    for p in &pos {
+        cx += p[0] as f64;
+        cy += p[1] as f64;
+    }
+    cx /= n as f64;
+    cy /= n as f64;
+    let (cx, cy) = (cx as f32, cy as f32);
+
+    let mut sq: Vec<f32> = pos
+        .iter()
+        .map(|p| {
+            let dx = p[0] - cx;
+            let dy = p[1] - cy;
+            dx * dx + dy * dy
+        })
+        .collect();
+    // 98th-percentile radius via quickselect (O(n))
+    let k = ((n as f32 * 0.98) as usize).min(n - 1);
+    sq.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+    let r98 = sq[k].max(1e-6).sqrt();
+
+    let world = (n as f32).sqrt() * 50.0;
+    let half = world / 2.0;
+    let scale = (half * 0.9) / r98;
+    for p in &mut pos {
+        p[0] = ((p[0] - cx) * scale).clamp(-half, half);
+        p[1] = ((p[1] - cy) * scale).clamp(-half, half);
+    }
     pos
 }
 

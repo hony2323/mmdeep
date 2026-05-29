@@ -19,8 +19,11 @@ Rust, then only ever draw the visible subgraph.
   - `src/bin/cli.rs` — headless `mmdeep-core` CLI (used by `scripts/bench.py`).
 - `src-tauri/` — Tauri v2 app; `src/lib.rs` is a thin command layer. Heavy
   `ensure_overview` runs on a blocking worker thread.
-- `src/` — React + Sigma.js frontend. `graphController.ts` owns the
-  graphology graph + Sigma instance and implements both modes.
+- `src/` — React + Sigma.js frontend. `graphController.ts` owns the graphology
+  graph + Sigma instance and implements the **map** (Google-Maps-style): the
+  whole graph is one fixed world (`setCustomBBox` to the layout bounds); pan/zoom
+  streams in only the viewport's nodes, importance-ranked, via diff updates.
+  (The backend still exposes discovery/expand commands, but the UI is map-first.)
 - `scripts/` — `generate.py` (topologies/presets), `bench.py`, `make_icon.py`.
 
 ## Build / run
@@ -37,6 +40,6 @@ Rust, then only ever draw the visible subgraph.
 
 - Backend serializes structs with serde defaults → **snake_case** JSON; the TS
   types in `src/api.ts` mirror that. Enums use kebab-case (`round-rect`).
-- Discovery layout flips Y (`-y`) for a top-down look; overview does not.
+- Importance for level-of-detail = node degree (`spatial.rs` grid index).
 - Parser is single-statement-per-line; inline `A -- text --> B` edge text is not
   parsed (use the `A -->|text| B` form). Add tests in the relevant `mod tests`.

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { api, type Dir, type Stats, type SubNode } from "./api";
+import { api, type Stats, type SubNode } from "./api";
 import { GraphController, type HudInfo } from "./graphController";
 
 export default function App() {
@@ -11,8 +11,6 @@ export default function App() {
   const [selected, setSelected] = useState<SubNode | null>(null);
   const [hud, setHud] = useState<HudInfo | null>(null);
   const [status, setStatus] = useState("Open a .mmd file to begin.");
-  const [mode, setMode] = useState<"discovery" | "overview">("discovery");
-  const [dir, setDir] = useState<Dir>("both");
   const [busy, setBusy] = useState(false);
 
   const [query, setQuery] = useState("");
@@ -29,12 +27,7 @@ export default function App() {
     return () => ctrl.destroy();
   }, []);
 
-  const handleOpen = useCallback(async () => {
-    const path = await openDialog({
-      multiple: false,
-      filters: [{ name: "Mermaid", extensions: ["mmd", "mermaid", "txt"] }],
-    });
-    if (typeof path !== "string") return;
+  const openPath = useCallback(async (path: string) => {
     setBusy(true);
     setStatus(`Parsing ${path}…`);
     try {
@@ -42,8 +35,7 @@ export default function App() {
       setStats(s);
       setSelected(null);
       setResults([]);
-      setMode("discovery");
-      await ctrlRef.current?.loadRoots();
+      await ctrlRef.current?.openMap();
     } catch (e) {
       setStatus(`Error: ${e}`);
     } finally {
@@ -51,38 +43,29 @@ export default function App() {
     }
   }, []);
 
-  const switchMode = useCallback(
-    async (next: "discovery" | "overview") => {
-      const ctrl = ctrlRef.current;
-      if (!ctrl || !stats) return;
-      setBusy(true);
-      try {
-        if (next === "overview") {
-          await ctrl.enterOverview();
-        } else {
-          await ctrl.loadRoots();
-        }
-        setMode(next);
-      } catch (e) {
-        setStatus(`Error: ${e}`);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [stats],
-  );
+  const handleOpen = useCallback(async () => {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "Mermaid", extensions: ["mmd", "mermaid", "txt"] }],
+    });
+    if (typeof path === "string") await openPath(path);
+  }, [openPath]);
+
+  // auto-open a file passed on the command line (file association / CLI arg)
+  useEffect(() => {
+    api.startupFile().then((p) => {
+      if (p) void openPath(p);
+    });
+  }, [openPath]);
 
   const runSearch = useCallback(async () => {
     if (!query.trim() || !stats) return;
     const res = await api.search(query.trim(), 50);
     setResults(res);
-    setStatus(`${res.length} match(es) for "${query.trim()}"`);
+    setStatus(`${res.length} match(es) for "${query.trim()}" — click one to fly there.`);
   }, [query, stats]);
 
-  const onDirChange = (d: Dir) => {
-    setDir(d);
-    ctrlRef.current?.setDir(d);
-  };
+  const zoomPct = hud ? Math.round((1 / Math.max(hud.ratio, 1e-3)) * 100) : 100;
 
   return (
     <div className="app">
@@ -90,32 +73,6 @@ export default function App() {
         <button className="primary" onClick={handleOpen} disabled={busy}>
           Open .mmd
         </button>
-
-        <div className="seg">
-          <button
-            className={mode === "discovery" ? "active" : ""}
-            onClick={() => switchMode("discovery")}
-            disabled={busy || !stats}
-          >
-            Discovery
-          </button>
-          <button
-            className={mode === "overview" ? "active" : ""}
-            onClick={() => switchMode("overview")}
-            disabled={busy || !stats}
-          >
-            Overview
-          </button>
-        </div>
-
-        <label className="dir">
-          Expand:
-          <select value={dir} onChange={(e) => onDirChange(e.target.value as Dir)}>
-            <option value="both">both</option>
-            <option value="out">outgoing</option>
-            <option value="in">incoming</option>
-          </select>
-        </label>
 
         <div className="search">
           <input
@@ -131,9 +88,15 @@ export default function App() {
         </div>
 
         <div className="cam">
-          <button onClick={() => ctrlRef.current?.zoomOut()}>−</button>
-          <button onClick={() => ctrlRef.current?.resetCamera()}>⤢</button>
-          <button onClick={() => ctrlRef.current?.zoomIn()}>+</button>
+          <button title="Zoom out" onClick={() => ctrlRef.current?.zoomOut()}>
+            −
+          </button>
+          <button title="Fit whole graph" onClick={() => ctrlRef.current?.resetCamera()}>
+            ⤢
+          </button>
+          <button title="Zoom in" onClick={() => ctrlRef.current?.zoomIn()}>
+            +
+          </button>
         </div>
       </header>
 
@@ -186,15 +149,8 @@ export default function App() {
                   {selected.out_degree} / {selected.in_degree}
                 </b>
               </div>
-              {selected.truncated > 0 && (
-                <div className="more">+{selected.truncated} more — click node to load</div>
-              )}
-              <button
-                className="full"
-                onClick={() => ctrlRef.current?.pageNeighbors(selected.id)}
-                disabled={mode !== "discovery"}
-              >
-                Expand neighbours
+              <button className="full" onClick={() => ctrlRef.current?.focusNode(selected.id)}>
+                Fly to node
               </button>
             </section>
           )}
@@ -207,9 +163,7 @@ export default function App() {
                   <li key={r.id}>
                     <button onClick={() => ctrlRef.current?.focusNode(r.id)}>
                       {trunc(r.label, 26)}
-                      <em>
-                        {r.out_degree + r.in_degree} deg
-                      </em>
+                      <em>{r.out_degree + r.in_degree} deg</em>
                     </button>
                   </li>
                 ))}
@@ -220,20 +174,26 @@ export default function App() {
 
         <main className="canvas-wrap">
           <div ref={containerRef} className="canvas" />
-          {hud && (
+          {hud && stats && (
             <div className="hud">
-              <span className={`pill ${hud.mode}`}>{hud.mode}</span>
-              <span>{hud.visibleNodes.toLocaleString()} nodes</span>
+              <span className="pill map">map</span>
+              <span>
+                {hud.visibleNodes.toLocaleString()} / {hud.totalNodes.toLocaleString()} nodes
+              </span>
               <span>{hud.visibleEdges.toLocaleString()} edges</span>
+              <span>{zoomPct}% zoom</span>
               <span>{hud.fps} fps</span>
-              <span>{hud.lastQueryMs.toFixed(1)} ms query</span>
+              <span>{hud.lastQueryMs.toFixed(1)} ms</span>
             </div>
           )}
-          {busy && <div className="overlay">Working…</div>}
+          {busy && <div className="overlay">Computing map layout…</div>}
           {!stats && (
             <div className="empty">
               <h1>mmdeep</h1>
-              <p>Open a Mermaid <code>.mmd</code> flowchart — even one with a million edges.</p>
+              <p>
+                Open a Mermaid <code>.mmd</code> flowchart — even one with a million edges — and
+                explore the whole graph as a map: scroll to zoom, drag to pan.
+              </p>
             </div>
           )}
         </main>

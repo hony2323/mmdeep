@@ -68,6 +68,7 @@ export interface OverviewInfo {
 export type Dir = "out" | "in" | "both";
 
 export const api = {
+  startupFile: () => invoke<string | null>("startup_file"),
   openFile: (path: string) => invoke<Stats>("open_file", { path }),
   stats: () => invoke<Stats>("stats"),
   getRoots: (limit: number) => invoke<SubGraphPayload>("get_roots", { limit }),
@@ -79,6 +80,7 @@ export const api = {
     invoke<SubNode[]>("search", { query, limit }),
   ensureOverview: (iterations?: number) =>
     invoke<OverviewInfo>("ensure_overview", { iterations: iterations ?? null }),
+  locate: (node: number) => invoke<[number, number] | null>("locate", { node }),
   viewport: (
     minx: number,
     miny: number,

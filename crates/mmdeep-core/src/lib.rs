@@ -126,14 +126,27 @@ impl Document {
         if self.overview.is_some() {
             return Ok(());
         }
+        let importance = self.importance();
         if let Some(pos) = self.load_cache() {
-            self.overview = Some(spatial::SpatialIndex::build(pos));
+            self.overview = Some(spatial::SpatialIndex::build(pos, importance));
             return Ok(());
         }
         let pos = layout::global_force(&self.graph, iterations);
         let _ = self.store_cache(&pos); // best-effort cache write
-        self.overview = Some(spatial::SpatialIndex::build(pos));
+        self.overview = Some(spatial::SpatialIndex::build(pos, importance));
         Ok(())
+    }
+
+    /// Per-node importance used for level-of-detail (degree).
+    fn importance(&self) -> Vec<u32> {
+        (0..self.graph.node_count() as NodeId)
+            .map(|n| self.graph.degree(n) as u32)
+            .collect()
+    }
+
+    /// World-space position of a node in the overview layout (for "fly to").
+    pub fn locate(&self, id: NodeId) -> Option<[f32; 2]> {
+        self.overview.as_ref().and_then(|i| i.position(id))
     }
 
     /// Query the overview viewport. Returns nodes inside the bounds (capped at

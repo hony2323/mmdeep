@@ -13,6 +13,9 @@ use tauri::State;
 
 type SharedDoc = Arc<Mutex<Option<Document>>>;
 
+/// A `.mmd` path passed on the command line (file association / `mmdeep x.mmd`).
+struct StartupFile(Option<String>);
+
 #[derive(Serialize)]
 struct OverviewInfo {
     minx: f32,
@@ -118,6 +121,16 @@ async fn ensure_overview(
 }
 
 #[tauri::command]
+fn startup_file(state: State<StartupFile>) -> Option<String> {
+    state.0.clone()
+}
+
+#[tauri::command]
+fn locate(node: u32, state: State<SharedDoc>) -> Result<Option<[f32; 2]>, String> {
+    with_doc(&state, |d| d.locate(node))
+}
+
+#[tauri::command]
 fn viewport(
     minx: f32,
     miny: f32,
@@ -131,9 +144,18 @@ fn viewport(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // first CLI arg that looks like a Mermaid file (skip flags)
+    let startup = std::env::args()
+        .skip(1)
+        .find(|a| {
+            !a.starts_with('-')
+                && (a.ends_with(".mmd") || a.ends_with(".mermaid") || a.ends_with(".txt"))
+        });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(SharedDoc::default())
+        .manage(StartupFile(startup))
         .invoke_handler(tauri::generate_handler![
             open_file,
             stats,
@@ -142,6 +164,8 @@ pub fn run() {
             neighbors_page,
             search,
             ensure_overview,
+            locate,
+            startup_file,
             viewport
         ])
         .run(tauri::generate_context!())

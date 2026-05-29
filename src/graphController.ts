@@ -1,9 +1,14 @@
-// Owns the graphology graph + Sigma renderer and implements both navigation
-// modes. Kept outside React so Sigma's imperative lifecycle isn't fighting the
-// render loop; React just calls methods and listens for callbacks.
+// Owns the graphology graph + Sigma renderer for the MAP view.
+//
+// The whole graph has one fixed global layout (computed/cached in the backend).
+// We pin Sigma's coordinate box to the full-graph bounds (`setCustomBBox`) so
+// the world is stable: panning/zooming behaves like a map and loaded subsets
+// always render at the same place. Only the nodes/edges inside the current
+// viewport are sent over IPC, ranked by importance (degree) so zoomed-out views
+// show major hubs and zooming in reveals local detail — like map tiles.
 import Graph from "graphology";
 import Sigma from "sigma";
-import { api, type Dir, type SubGraphPayload, type SubNode, type Shape } from "./api";
+import { api, type SubGraphPayload, type SubNode, type Shape } from "./api";
 
 const SHAPE_COLORS: Record<Shape, string> = {
   default: "#6ea8fe",
@@ -20,14 +25,18 @@ const SHAPE_COLORS: Record<Shape, string> = {
   asymmetric: "#ffe066",
 };
 
-const MORE_COLOR = "#f783ac";
+const DIM_NODE = "#262d3c";
+const DIM_EDGE = "#1b2230";
+const HILITE_EDGE = "#6ea8fe";
 
 export interface HudInfo {
-  mode: "discovery" | "overview";
   visibleNodes: number;
   visibleEdges: number;
+  totalNodes: number;
+  totalEdges: number;
   fps: number;
   lastQueryMs: number;
+  ratio: number;
 }
 
 export interface Callbacks {
@@ -36,24 +45,24 @@ export interface Callbacks {
   onStatus: (msg: string) => void;
 }
 
-const DISCOVERY_PAGE = 50;
-
 export class GraphController {
   private graph: Graph;
   private sigma: Sigma;
   private cb: Callbacks;
 
-  mode: "discovery" | "overview" = "discovery";
-  dir: Dir = "both";
-  private flipY = true;
+  private world = { minx: 0, miny: 0, maxx: 0, maxy: 0 };
+  private totalNodes = 0;
+  private totalEdges = 0;
+  private ready = false;
 
-  // discovery paging state
-  private degree = new Map<number, number>();
-  private loaded = new Map<number, number>();
-
-  // overview state
-  private overviewBounds = { minx: 0, miny: 0, maxx: 0, maxy: 0 };
+  // viewport refresh scheduling / reentrancy
   private refreshTimer: number | null = null;
+  private refreshing = false;
+  private refreshQueued = false;
+
+  // hover highlight
+  private hovered: string | null = null;
+  private hoverSet = new Set<string>();
 
   // perf HUD
   private lastQueryMs = 0;
@@ -66,39 +75,29 @@ export class GraphController {
     this.graph = new Graph({ multi: true, type: "directed" });
     this.sigma = new Sigma(this.graph, container, {
       renderLabels: true,
-      labelRenderedSizeThreshold: 8,
-      labelDensity: 0.6,
-      labelGridCellSize: 80,
-      defaultEdgeColor: "#3a4254",
-      defaultNodeColor: "#6ea8fe",
-      labelColor: { color: "#dfe5f0" },
+      labelRenderedSizeThreshold: 7,
+      labelDensity: 0.7,
+      labelGridCellSize: 140,
+      labelColor: { color: "#e7ecf5" },
       labelFont: "Inter, system-ui, sans-serif",
       labelSize: 12,
+      labelWeight: "500",
+      defaultNodeColor: "#6ea8fe",
+      defaultEdgeColor: "#2b3346",
+      defaultEdgeType: "arrow",
       zIndex: true,
     });
 
-    this.sigma.on("clickNode", ({ node }) => this.handleClick(node));
-    this.sigma.on("enterNode", ({ node }) => this.emitSelect(node));
+    this.sigma.on("clickNode", ({ node }) => this.flyToNode(node));
+    this.sigma.on("enterNode", ({ node }) => this.setHover(node));
+    this.sigma.on("leaveNode", () => this.setHover(null));
+    this.sigma.on("clickStage", () => this.setHover(null));
 
-    // LOD: hide labels when zoomed out; fade distant edges.
-    this.sigma.setSetting("nodeReducer", (_key, data) => {
-      const ratio = this.sigma.getCamera().getState().ratio;
-      const res: any = { ...data };
-      if (this.mode === "overview" && ratio > 1.2) res.label = "";
-      return res;
-    });
-    this.sigma.setSetting("edgeReducer", (_key, data) => {
-      const ratio = this.sigma.getCamera().getState().ratio;
-      const res: any = { ...data };
-      if (this.mode === "overview" && ratio > 2.0) res.hidden = true;
-      return res;
-    });
+    this.sigma.setSetting("nodeReducer", (node, data) => this.nodeReducer(node, data));
+    this.sigma.setSetting("edgeReducer", (edge, data) => this.edgeReducer(edge, data));
 
-    this.sigma.getCamera().on("updated", () => {
-      if (this.mode === "overview") this.scheduleViewportRefresh();
-    });
+    this.sigma.getCamera().on("updated", () => this.scheduleRefresh());
 
-    // fps + hud ticker
     this.sigma.on("afterRender", () => {
       this.frames++;
     });
@@ -115,24 +114,66 @@ export class GraphController {
     this.sigma.kill();
   }
 
-  // -- shared helpers --------------------------------------------------------
+  // -- reducers (hover highlight + label LOD) -------------------------------
 
-  private gx(n: SubNode) {
-    return n.x;
-  }
-  private gy(n: SubNode) {
-    return this.flipY ? -n.y : n.y;
+  private nodeReducer(node: string, data: any) {
+    const res: any = { ...data };
+    if (this.hovered) {
+      if (!this.hoverSet.has(node)) {
+        res.color = DIM_NODE;
+        res.label = "";
+        res.zIndex = 0;
+      } else {
+        res.zIndex = node === this.hovered ? 3 : 2;
+        res.forceLabel = true;
+        if (node === this.hovered) res.highlighted = true;
+      }
+    }
+    return res;
   }
 
-  private styleNode(n: SubNode, x: number, y: number) {
-    const hasMore = n.truncated > 0;
+  private edgeReducer(edge: string, data: any) {
+    const res: any = { ...data };
+    if (this.hovered) {
+      const [s, t] = this.graph.extremities(edge);
+      if (s === this.hovered || t === this.hovered) {
+        res.color = HILITE_EDGE;
+        res.zIndex = 2;
+        res.size = (res.size ?? 1) + 0.6;
+      } else {
+        res.color = DIM_EDGE;
+        res.zIndex = 0;
+      }
+    }
+    return res;
+  }
+
+  private setHover(node: string | null) {
+    if (node && this.graph.hasNode(node)) {
+      this.hovered = node;
+      this.hoverSet = new Set<string>(this.graph.neighbors(node));
+      this.hoverSet.add(node);
+      this.emitSelect(node);
+    } else {
+      this.hovered = null;
+      this.hoverSet.clear();
+    }
+    this.sigma.refresh({ skipIndexation: true });
+  }
+
+  // -- node styling ----------------------------------------------------------
+
+  private nodeSize(deg: number) {
+    return Math.max(3, Math.min(22, 3 + Math.sqrt(deg) * 1.4));
+  }
+
+  private styleAttrs(n: SubNode) {
     const deg = n.out_degree + n.in_degree;
     return {
-      x,
-      y,
-      size: Math.max(3, Math.min(22, 3 + Math.sqrt(deg) * 1.6)),
+      x: n.x,
+      y: n.y,
+      size: this.nodeSize(deg),
       color: SHAPE_COLORS[n.shape] ?? SHAPE_COLORS.default,
-      borderColor: hasMore ? MORE_COLOR : undefined,
       label: n.label,
       name: n.name,
       shape: n.shape,
@@ -141,51 +182,6 @@ export class GraphController {
       truncated: n.truncated,
       zIndex: deg,
     };
-  }
-
-  private mergePayload(payload: SubGraphPayload, anchorId?: number) {
-    let dx = 0;
-    let dy = 0;
-    if (anchorId != null && this.graph.hasNode(String(anchorId))) {
-      const a = payload.nodes.find((n) => n.id === anchorId);
-      if (a) {
-        dx = (this.graph.getNodeAttribute(String(anchorId), "x") as number) - this.gx(a);
-        dy = (this.graph.getNodeAttribute(String(anchorId), "y") as number) - this.gy(a);
-      }
-    }
-    for (const n of payload.nodes) {
-      const key = String(n.id);
-      const x = this.gx(n) + dx;
-      const y = this.gy(n) + dy;
-      if (!this.graph.hasNode(key)) {
-        this.graph.addNode(key, this.styleNode(n, x, y));
-        this.degree.set(n.id, n.out_degree + n.in_degree);
-        if (!this.loaded.has(n.id)) this.loaded.set(n.id, 0);
-      } else {
-        // refresh the "+N more" badge as more neighbours come in
-        this.graph.setNodeAttribute(key, "truncated", n.truncated);
-        this.graph.setNodeAttribute(
-          key,
-          "borderColor",
-          n.truncated > 0 ? MORE_COLOR : undefined,
-        );
-      }
-    }
-    for (const e of payload.edges) {
-      const s = String(e.source);
-      const t = String(e.target);
-      if (this.graph.hasNode(s) && this.graph.hasNode(t)) {
-        const ek = `${e.source}->${e.target}`;
-        if (!this.graph.hasEdge(ek)) {
-          this.graph.addEdgeWithKey(ek, s, t, {
-            size: e.style === "thick" ? 2.5 : 1,
-            color: e.style === "dotted" ? "#566076" : "#3a4254",
-            type: "arrow",
-            label: e.label ?? undefined,
-          });
-        }
-      }
-    }
   }
 
   private emitSelect(nodeKey: string) {
@@ -197,7 +193,7 @@ export class GraphController {
       shape: a.shape,
       out_degree: a.out_degree,
       in_degree: a.in_degree,
-      truncated: a.truncated,
+      truncated: a.truncated ?? 0,
       x: a.x,
       y: a.y,
     });
@@ -205,175 +201,168 @@ export class GraphController {
 
   private emitHud() {
     this.cb.onHud({
-      mode: this.mode,
       visibleNodes: this.graph.order,
       visibleEdges: this.graph.size,
+      totalNodes: this.totalNodes,
+      totalEdges: this.totalEdges,
       fps: this.fps,
       lastQueryMs: this.lastQueryMs,
+      ratio: this.sigma.getCamera().getState().ratio,
     });
   }
 
-  setDir(dir: Dir) {
-    this.dir = dir;
-  }
+  // -- open the map ----------------------------------------------------------
 
-  // -- discovery mode --------------------------------------------------------
-
-  async loadRoots(limit = 60) {
-    this.mode = "discovery";
-    this.flipY = true;
+  async openMap() {
+    this.ready = false;
     this.graph.clear();
-    this.degree.clear();
-    this.loaded.clear();
-    const t = performance.now();
-    const payload = await api.getRoots(limit);
-    this.lastQueryMs = performance.now() - t;
-    this.mergePayload(payload);
-    // initialise loaded counts from what's already shown
-    for (const n of payload.nodes) {
-      this.loaded.set(n.id, (this.loaded.get(n.id) ?? 0));
-    }
-    this.fit();
-    this.cb.onStatus(
-      `Loaded ${payload.nodes.length} seed nodes. Click a node to expand its neighbours.`,
-    );
-    this.emitHud();
-  }
-
-  private async handleClick(nodeKey: string) {
-    this.emitSelect(nodeKey);
-    if (this.mode === "discovery") {
-      await this.pageNeighbors(Number(nodeKey));
-    } else {
-      // overview: focus + page neighbours into a fresh discovery view
-      await this.focusInDiscovery(Number(nodeKey));
-    }
-  }
-
-  /** Page in the next chunk of a node's neighbours — "pagination for graphs". */
-  async pageNeighbors(id: number) {
-    const offset = this.loaded.get(id) ?? 0;
-    const t = performance.now();
-    const payload = await api.neighborsPage(id, this.dir, offset, DISCOVERY_PAGE);
-    this.lastQueryMs = performance.now() - t;
-    const before = this.graph.order;
-    this.mergePayload(payload, id);
-    const added = this.graph.order - before;
-    // advance the page cursor by the neighbours actually returned (minus self)
-    const returnedNeighbors = Math.max(0, payload.nodes.length - 1);
-    this.loaded.set(id, offset + returnedNeighbors);
-    this.cb.onStatus(
-      `+${added} node(s) from ${this.graph.getNodeAttribute(String(id), "name")}` +
-        (payload.truncated ? " (more available — click again)" : ""),
-    );
-    this.emitHud();
-  }
-
-  private async focusInDiscovery(id: number) {
-    this.mode = "discovery";
-    this.flipY = true;
-    this.graph.clear();
-    this.degree.clear();
-    this.loaded.clear();
-    const t = performance.now();
-    const payload = await api.expand([id], 1, 200, this.dir);
-    this.lastQueryMs = performance.now() - t;
-    this.mergePayload(payload);
-    this.loaded.set(id, Math.max(0, payload.nodes.length - 1));
-    this.fit();
-    this.emitHud();
-  }
-
-  /** Center the view on a searched node and expand it. */
-  async focusNode(id: number) {
-    await this.focusInDiscovery(id);
-    if (this.graph.hasNode(String(id))) {
-      this.emitSelect(String(id));
-      this.fit();
-    }
-  }
-
-  // -- overview mode ---------------------------------------------------------
-
-  async enterOverview() {
-    this.cb.onStatus("Computing overview layout… (cached after first run)");
+    this.setHover(null);
+    this.cb.onStatus("Computing map layout… (one-time, cached afterwards)");
     const info = await api.ensureOverview();
-    this.overviewBounds = {
-      minx: info.minx,
-      miny: info.miny,
-      maxx: info.maxx,
-      maxy: info.maxy,
-    };
-    this.mode = "overview";
-    this.flipY = false;
-    this.graph.clear();
-    this.degree.clear();
-    this.loaded.clear();
+    this.world = { minx: info.minx, miny: info.miny, maxx: info.maxx, maxy: info.maxy };
+    this.totalNodes = info.node_count;
+    this.totalEdges = info.edge_count;
+
+    // pin the coordinate system to the whole-graph bounds -> stable world
+    this.sigma.setCustomBBox({
+      x: [this.world.minx, this.world.maxx],
+      y: [this.world.miny, this.world.maxy],
+    });
+    this.sigma.getCamera().setState({ x: 0.5, y: 0.5, ratio: 1, angle: 0 });
+    this.sigma.refresh();
+    this.ready = true;
+
     this.cb.onStatus(
-      `Overview ready: ${info.node_count.toLocaleString()} nodes, ` +
-        `${info.edge_count.toLocaleString()} edges (layout ${info.compute_ms.toFixed(0)} ms).`,
+      `Map ready: ${info.node_count.toLocaleString()} nodes, ` +
+        `${info.edge_count.toLocaleString()} edges (layout ${info.compute_ms.toFixed(0)} ms). ` +
+        `Scroll to zoom, drag to pan.`,
     );
-    this.fitBounds(this.overviewBounds);
     await this.refreshViewport();
   }
 
-  private scheduleViewportRefresh() {
+  // -- viewport streaming ----------------------------------------------------
+
+  private scheduleRefresh() {
+    if (!this.ready) return;
     if (this.refreshTimer) window.clearTimeout(this.refreshTimer);
-    this.refreshTimer = window.setTimeout(() => this.refreshViewport(), 140);
+    this.refreshTimer = window.setTimeout(() => this.refreshViewport(), 120);
   }
 
   private async refreshViewport() {
-    if (this.mode !== "overview") return;
-    const { width, height } = this.sigma.getDimensions();
-    const tl = this.sigma.viewportToGraph({ x: 0, y: 0 });
-    const br = this.sigma.viewportToGraph({ x: width, y: height });
-    const minx = Math.min(tl.x, br.x);
-    const maxx = Math.max(tl.x, br.x);
-    const miny = Math.min(tl.y, br.y);
-    const maxy = Math.max(tl.y, br.y);
-    // LOD budget: fewer nodes when zoomed out (larger ratio).
-    const ratio = this.sigma.getCamera().getState().ratio;
-    const budget = ratio > 2 ? 1500 : ratio > 0.8 ? 4000 : 8000;
-
-    const t = performance.now();
-    const payload = await api.viewport(minx, miny, maxx, maxy, budget);
-    this.lastQueryMs = performance.now() - t;
-
-    // rebuild the visible set
-    this.graph.clear();
-    for (const n of payload.nodes) {
-      this.graph.addNode(String(n.id), this.styleNode(n, this.gx(n), this.gy(n)));
+    if (!this.ready) return;
+    if (this.refreshing) {
+      this.refreshQueued = true;
+      return;
     }
-    for (const e of payload.edges) {
-      const s = String(e.source);
-      const t2 = String(e.target);
-      if (this.graph.hasNode(s) && this.graph.hasNode(t2)) {
-        const ek = `${e.source}->${e.target}`;
-        if (!this.graph.hasEdge(ek))
-          this.graph.addEdgeWithKey(ek, s, t2, { size: 0.8, type: "arrow" });
+    this.refreshing = true;
+    try {
+      const { width, height } = this.sigma.getDimensions();
+      const tl = this.sigma.viewportToGraph({ x: 0, y: 0 });
+      const br = this.sigma.viewportToGraph({ x: width, y: height });
+      // query a margin around the visible area so panning has a buffer
+      const mx = Math.abs(br.x - tl.x) * 0.25;
+      const my = Math.abs(br.y - tl.y) * 0.25;
+      const minx = Math.min(tl.x, br.x) - mx;
+      const maxx = Math.max(tl.x, br.x) + mx;
+      const miny = Math.min(tl.y, br.y) - my;
+      const maxy = Math.max(tl.y, br.y) + my;
+
+      const ratio = this.sigma.getCamera().getState().ratio;
+      const budget = ratio > 0.55 ? 1500 : ratio > 0.2 ? 4500 : 9000;
+
+      const t = performance.now();
+      const payload = await api.viewport(minx, miny, maxx, maxy, budget);
+      this.lastQueryMs = performance.now() - t;
+      this.applyDiff(payload);
+      this.emitHud();
+    } finally {
+      this.refreshing = false;
+      if (this.refreshQueued) {
+        this.refreshQueued = false;
+        void this.refreshViewport();
       }
     }
-    this.emitHud();
   }
 
-  // -- camera helpers --------------------------------------------------------
+  /** Reconcile the loaded graph with the viewport payload (add/remove diff so
+   * stable nodes don't flicker). */
+  private applyDiff(payload: SubGraphPayload) {
+    const wantNodes = new Set<string>();
+    for (const n of payload.nodes) wantNodes.add(String(n.id));
 
-  private fit() {
-    // let sigma autoscale to the current graph extent
-    this.sigma.getCamera().animatedReset();
+    // drop nodes no longer in view (also drops their edges)
+    for (const node of this.graph.nodes()) {
+      if (!wantNodes.has(node)) this.graph.dropNode(node);
+    }
+    // add new nodes
+    for (const n of payload.nodes) {
+      const key = String(n.id);
+      if (!this.graph.hasNode(key)) this.graph.addNode(key, this.styleAttrs(n));
+    }
+    // reconcile edges
+    const wantEdges = new Set<string>();
+    for (const e of payload.edges) {
+      const s = String(e.source);
+      const t = String(e.target);
+      if (!this.graph.hasNode(s) || !this.graph.hasNode(t)) continue;
+      const ek = `${e.source}->${e.target}`;
+      wantEdges.add(ek);
+      if (!this.graph.hasEdge(ek)) {
+        this.graph.addEdgeWithKey(ek, s, t, {
+          size: e.style === "thick" ? 2 : 0.8,
+          color: e.style === "dotted" ? "#3a4356" : "#2b3346",
+          type: "arrow",
+          label: e.label ?? undefined,
+        });
+      }
+    }
+    for (const ek of this.graph.edges()) {
+      if (!wantEdges.has(ek)) this.graph.dropEdge(ek);
+    }
   }
 
-  private fitBounds(_b: { minx: number; miny: number; maxx: number; maxy: number }) {
-    this.sigma.getCamera().animatedReset();
+  // -- navigation ------------------------------------------------------------
+
+  private flyToNode(nodeKey: string) {
+    if (!this.graph.hasNode(nodeKey)) return;
+    this.emitSelect(nodeKey);
+    const d = this.sigma.getNodeDisplayData(nodeKey);
+    if (!d) return;
+    const ratio = this.sigma.getCamera().getState().ratio;
+    this.sigma.getCamera().animate(
+      { x: d.x, y: d.y, ratio: Math.min(ratio, 0.18) },
+      { duration: 500 },
+    );
+  }
+
+  /** Fly to a node found via search, even if it isn't currently loaded. */
+  async focusNode(id: number) {
+    const pos = await api.locate(id);
+    if (!pos) {
+      this.cb.onStatus("That node has no map position yet — open the map first.");
+      return;
+    }
+    const key = String(id);
+    if (!this.graph.hasNode(key)) {
+      // add a temporary node at its world position so the camera can target it
+      this.graph.addNode(key, { x: pos[0], y: pos[1], size: 8, color: "#ffe066", label: id });
+    }
+    this.sigma.refresh({ skipIndexation: true });
+    const d = this.sigma.getNodeDisplayData(key);
+    if (d) {
+      this.sigma.getCamera().animate({ x: d.x, y: d.y, ratio: 0.12 }, { duration: 600 });
+    }
+    // surrounding detail (and the real node attributes) load on the next refresh
+    window.setTimeout(() => this.refreshViewport(), 650);
   }
 
   zoomIn() {
-    this.sigma.getCamera().animatedZoom(1.5);
+    this.sigma.getCamera().animatedZoom(1.6);
   }
   zoomOut() {
-    this.sigma.getCamera().animatedUnzoom(1.5);
+    this.sigma.getCamera().animatedUnzoom(1.6);
   }
   resetCamera() {
-    this.sigma.getCamera().animatedReset();
+    this.sigma.getCamera().animate({ x: 0.5, y: 0.5, ratio: 1, angle: 0 }, { duration: 400 });
   }
 }
