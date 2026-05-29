@@ -1,0 +1,21 @@
+[package]
+name = "mmdeep-core"
+version = "0.1.0"
+edition = "2021"
+description = "Parsing, indexing, discovery and layout for very large Mermaid flowcharts"
+license = "MIT"
+
+[lib]
+name = "mmdeep_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mmdeep-core"
+path = "src/bin/cli.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+rstar = "0.12"
+rayon = "1"

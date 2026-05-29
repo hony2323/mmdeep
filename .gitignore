@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target
+**/target
+
+# Node
+node_modules
+dist
+.vite
+
+# Tauri generated
+src-tauri/gen
+
+# Layout cache sidecars
+*.mmdlayout
+
+# Generated large examples (small ones are committed; see examples/README)
+examples/large.mmd
+examples/huge.mmd
+examples/bench-*.mmd
+examples/*.mmdlayout
+
+# Generated icon intermediate
+scripts/app-icon.png
+
+# Benchmark outputs
+benchmarks/*.json
+benchmarks/*.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode
